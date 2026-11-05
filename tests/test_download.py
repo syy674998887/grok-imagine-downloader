@@ -2,6 +2,8 @@
 import io
 import json
 from pathlib import Path
+import plistlib
+import signal
 import subprocess
 import sys
 import tempfile
@@ -10,6 +12,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import download as downloader
+
+REAL_CHROME_UA = downloader.chrome_ua  # setUp replaces it; its own test needs the real function
 
 
 class DownloaderTests(unittest.TestCase):
@@ -27,6 +31,8 @@ class DownloaderTests(unittest.TestCase):
         self.patch(downloader, "chrome_ua", return_value="offline-test-UA")
         self.patch(downloader.shutil, "which", return_value="curl")
         self.patch(downloader.time, "sleep")
+        downloader.STOP.clear()
+        self.addCleanup(downloader.STOP.clear)
         # Any test that accidentally reaches a real command fails immediately.
         self.process = self.patch(
             downloader.subprocess, "run", side_effect=AssertionError("Unexpected subprocess")
@@ -300,16 +306,18 @@ class DownloaderTests(unittest.TestCase):
         self.assertEqual(downloader.load_metadata(), [])
 
     def test_main_does_not_overwrite_invalid_metadata(self):
-        self.patch(downloader, "fetch_manifest", return_value=[])
+        listing = self.patch(downloader, "fetch_manifest", return_value=[])
         writer = self.patch(downloader, "write_metadata")
         path = self.dest / "metadata.json"
         for original in ('{"broken":', '{}', '[null]'):
             with self.subTest(original=original):
                 path.write_text(original, encoding="utf-8")
-                with self.assertRaises(RuntimeError):
+                with self.assertRaises(SystemExit) as result:
                     downloader.main([])
+                self.assertIn("metadata.json", str(result.exception.code))
                 self.assertEqual(path.read_text(encoding="utf-8"), original)
         writer.assert_not_called()
+        listing.assert_not_called()  # reported before the (possibly long) asset listing
 
     def test_main_rejects_nonpositive_workers_before_fetching(self):
         listing = self.patch(downloader, "fetch_manifest")
@@ -318,6 +326,171 @@ class DownloaderTests(unittest.TestCase):
                 downloader.main(["--workers", workers])
             self.assertEqual(result.exception.code, 2)
         listing.assert_not_called()
+
+    def test_curl_ends_stalled_transfers_instead_of_capping_their_duration(self):
+        self.process.side_effect = None
+        self.process.return_value = subprocess.CompletedProcess([], 0, b"200", b"")
+        downloader.curl("https://example.invalid/asset", out=str(self.root / "asset"))
+        downloader.chat_api("https://example.invalid/chat")
+        media, chat = (call.args[0] for call in self.process.call_args_list)
+        for cmd in (media, chat):
+            self.assertEqual(cmd[cmd.index("--speed-limit") + 1], str(downloader.STALL_RATE))
+            self.assertEqual(cmd[cmd.index("--speed-time") + 1], str(downloader.STALL_TIME))
+        self.assertEqual(media[media.index("--max-time") + 1], str(downloader.MAX_TIME))
+        self.assertEqual(chat[chat.index("--max-time") + 1], "60")
+
+    def test_curl_interrupted_by_ctrl_c_stops_the_run(self):
+        self.process.side_effect = None
+        for status in (-signal.SIGINT, 0xC000013A):  # POSIX signal, Windows STATUS_CONTROL_C_EXIT
+            with self.subTest(status=status):
+                downloader.STOP.clear()
+                self.process.return_value = subprocess.CompletedProcess([], status, b"", b"")
+                self.assertEqual(downloader.curl("https://example.invalid/asset"), (b"000", "interrupted"))
+                self.assertTrue(downloader.STOP.is_set())
+
+    def test_download_does_not_retry_after_an_interrupt(self):
+        item = self.item()
+        self.process.side_effect = None
+        self.process.return_value = subprocess.CompletedProcess([], -signal.SIGINT, b"", b"")
+        self.assertEqual(downloader.download(item)[0], "cancel")
+        self.assertEqual(self.process.call_count, 1)
+        self.assertFalse(Path(item["path"] + ".part").exists())
+
+    def test_pool_starts_no_new_work_after_stop(self):
+        started, results = [], []
+
+        def work(n):
+            started.append(n)
+            downloader.STOP.set()
+            return n
+
+        downloader.run_pool(work, range(100), 2, results.append)
+        self.assertEqual(sorted(results), sorted(started))
+        self.assertLessEqual(len(started), 4)  # only the small queued window ran
+
+    def test_main_saves_metadata_and_exits_130_on_ctrl_c(self):
+        done = self.item("done", payload=b"data")
+        self.patch(downloader, "fetch_manifest", return_value=[self.asset("done"), self.asset("pending")])
+        self.patch(downloader, "download_all", side_effect=KeyboardInterrupt)
+        with self.assertRaises(SystemExit) as result:
+            downloader.main([])
+        self.assertEqual(result.exception.code, 130)
+        self.assertEqual([row["id"] for row in self.metadata()], [done["id"]])
+        self.assertIn("Ctrl+C", sys.stderr.getvalue())
+
+    def test_listing_retries_rate_limited_pages_then_paces_the_rest(self):
+        pages = [self.page([{"assetId": "1"}], "a"), (b"429", "rate limited"), (b"429", "rate limited"),
+                 self.page([{"assetId": "2"}], "b"), self.page([{"assetId": "3"}])]
+        self.patch(downloader, "curl", side_effect=self.serve_pages(pages))
+        self.assertEqual([a["assetId"] for a in downloader.fetch_manifest()], ["1", "2", "3"])
+        waits = [call.args[0] for call in downloader.time.sleep.call_args_list]
+        self.assertEqual(waits, [downloader.LISTING_BACKOFF[0], downloader.LISTING_BACKOFF[1], 1])
+
+    def test_listing_keeps_the_pages_read_before_a_persistent_failure(self):
+        attempts = len(downloader.LISTING_BACKOFF) + 1
+        pages = [self.page([{"assetId": "1"}], "a")] + [(b"503", "unavailable")] * attempts
+        request = self.patch(downloader, "curl", side_effect=self.serve_pages(pages))
+        with self.assertRaises(downloader.ListingIncomplete) as result:
+            downloader.fetch_manifest()
+        self.assertEqual(result.exception.assets, [{"assetId": "1"}])
+        self.assertIn("HTTP 503", result.exception.reason)
+        self.assertEqual(request.call_count, 1 + attempts)
+
+    def test_listing_does_not_retry_authentication_errors(self):
+        request = self.patch(downloader, "curl", side_effect=self.serve_pages([(b"401", "unauthorized")]))
+        with self.assertRaises(SystemExit) as result:
+            downloader.fetch_manifest()
+        self.assertEqual(result.exception.code, 1)
+        self.assertEqual(request.call_count, 1)
+        self.assertIn("cookie", sys.stderr.getvalue())
+
+    def test_listing_reports_a_page_that_is_not_json(self):
+        self.patch(downloader, "curl", side_effect=self.serve_pages([(b"<html>sign in</html>200", "")]))
+        with self.assertRaises(SystemExit):
+            downloader.fetch_manifest()
+        self.assertIn("JSON", sys.stderr.getvalue())
+
+    def test_main_archives_a_partial_listing_and_exits_1(self):
+        self.patch(downloader, "fetch_manifest",
+                   side_effect=downloader.ListingIncomplete([self.asset("listed")], "page 2: HTTP 429"))
+
+        def transfer(url, out):
+            Path(out).write_bytes(b"data")
+            return b"200", ""
+
+        self.patch(downloader, "curl", side_effect=transfer)
+        with self.assertRaises(SystemExit) as result:
+            downloader.main([])
+        self.assertEqual(result.exception.code, 1)
+        self.assertEqual([row["id"] for row in self.metadata()], ["listed"])
+        self.assertIn("page 2: HTTP 429", sys.stderr.getvalue())
+
+    def test_plan_lengthens_the_id_prefix_on_a_name_collision(self):
+        items = downloader.plan([self.asset("abcdefgh-1111"), self.asset("abcdefgh-2222")])
+        self.assertEqual([Path(item["rel"]).name for item in items],
+                         ["20260102-030405_abcdefgh.mp4", "20260102-030405_abcdefgh-222.mp4"])
+
+    def test_plan_skips_malformed_entries_and_neutralises_names(self):
+        missing_key = self.asset("missing-key")
+        del missing_key["key"]
+        bad_size = dict(self.asset("bad-size"), sizeBytes="n/a")
+        odd = dict(self.asset("../../x:y"), fileSource="UPLOAD", mimeType="image/x", name="a/../b.e x")
+        items = downloader.plan([self.asset("good"), missing_key, bad_size, "not-an-asset", odd])
+        self.assertEqual([item["id"] for item in items], ["good", "../../x:y"])
+        self.assertEqual(items[1]["rel"], "uploads/20260102-030405_______x_.bin")
+        self.assertIn("missing-key, bad-size", sys.stderr.getvalue())
+
+    def test_main_rejects_a_cookie_path_containing_an_equals_sign(self):
+        folder = self.root / "a=b"
+        folder.mkdir()
+        cookies = folder / "cookies.txt"
+        cookies.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+        listing = self.patch(downloader, "fetch_manifest")
+        with self.assertRaises(SystemExit) as result:
+            downloader.main(["--cookies", str(cookies)])
+        self.assertIn("'='", str(result.exception.code))
+        listing.assert_not_called()
+
+    def test_prompt_lookup_stops_after_a_rate_limit(self):
+        first = self.item("first", payload=b"data")
+        second = self.item("second", payload=b"data")
+        second["conv"] = "conversation-2"
+        self.patch(downloader, "PROMPT_WORKERS", 1)
+        api = self.patch(downloader, "chat_api", return_value=("429", None))
+        downloader.fetch_prompts([first, second])
+        self.assertEqual(api.call_count, 1)
+        self.assertEqual((first["gen"], second["gen"]), ({}, {}))
+        self.assertIn("HTTP 429", sys.stderr.getvalue())
+
+    def test_chrome_ua_uses_the_local_chrome_version(self):
+        data, bundle = self.root / "chrome", self.root / "Info.plist"
+        data.mkdir()
+        self.patch(downloader, "CHROME_DATA", {"darwin": str(data), "win32": str(data)})
+        self.patch(downloader, "MAC_CHROME_PLIST", str(bundle))
+        cases = [
+            ("darwin", "142.0.7444.60\n", None, "(Macintosh; Intel Mac OS X 10_15_7)", "Chrome/142.0.0.0"),
+            ("win32", "141.0.1\n", None, "(Windows NT 10.0; Win64; x64)", "Chrome/141.0.0.0"),
+            ("darwin", None, "140.0.1", "(Macintosh;", "Chrome/140.0.0.0"),  # app bundle fallback
+            ("darwin", "not-a-version", None, None, None),
+            ("linux", "142.0\n", None, None, None),
+        ]
+        for platform, last_version, bundle_version, os_part, chrome in cases:
+            with self.subTest(platform=platform, last_version=last_version, bundle_version=bundle_version):
+                for path in (data / "Last Version", bundle):
+                    if path.exists():
+                        path.unlink()
+                if last_version is not None:
+                    (data / "Last Version").write_text(last_version, encoding="utf-8")
+                if bundle_version is not None:
+                    with open(bundle, "wb") as f:
+                        plistlib.dump({"CFBundleShortVersionString": bundle_version}, f)
+                with mock.patch.object(downloader.sys, "platform", platform):
+                    ua = REAL_CHROME_UA()
+                if chrome is None:
+                    self.assertIsNone(ua)
+                else:
+                    self.assertIn(os_part, ua)
+                    self.assertIn(chrome, ua)
 
 
 if __name__ == "__main__":

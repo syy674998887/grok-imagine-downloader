@@ -9,7 +9,7 @@ This is an unofficial tool using Grok's web endpoints. The available assets, res
 ## Features
 
 - Paginate through the Imagine asset listing and download generated videos, images, and uploaded references.
-- Download concurrently, retry failed transfers, and check file sizes when the API provides them.
+- Download concurrently, retry failed transfers and rate-limited asset-list pages, and check file sizes when the API provides them.
 - Skip files already present with the expected size, so you can rerun the command after an interruption.
 - Write a UTF-8 `metadata.json` index and preserve generation metadata for valid local files.
 - Optionally retrieve prompts and generation settings from the source conversations.
@@ -86,7 +86,7 @@ output/
 └── metadata.json   Index of complete local files
 ~~~
 
-Files use `YYYYMMDD-HHMMSS_<asset-ID-prefix>.<extension>`. The ID prefix starts at eight characters and is extended if a filename collision occurs within the listing.
+Files use `YYYYMMDD-HHMMSS_<asset-ID-prefix>.<extension>`, where the time is the asset's creation time in UTC. The ID prefix starts at eight characters and is extended if a filename collision occurs within the listing. In API-provided name parts, characters other than letters, digits, `_`, and `-` are replaced with `_`, and unrecognized extensions become `.bin`.
 
 Each metadata record contains:
 
@@ -113,20 +113,22 @@ The asset listing may omit generation settings. With `--prompts`, the script loo
 ## Reliability and limitations
 
 - Downloads go to a `.part` file and are renamed after a successful transfer and size check. Failed files are retried; rerunning skips complete files and restarts incomplete transfers. HTTP Range resume is not implemented.
+- A transfer is abandoned when it stalls (below 1 KiB/s for 60 seconds) rather than after a fixed time, so large files on slow connections can still finish.
 - Validation compares byte counts, not hashes. If the API reports no size or zero, the script only checks that the file is nonempty; it cannot verify completeness.
-- Duplicate asset IDs are skipped within a listing; identical content under different IDs is not deduplicated.
-- Once the asset list has been loaded, the download/prompt phase writes metadata on completion and in its cleanup path after an error or Ctrl+C. A forced process termination may prevent cleanup.
-- Media download failures produce a nonzero exit status. Prompt lookup failures can leave a successful media archive with incomplete generation metadata.
-- The tool follows pagination until no next-page token remains and rejects repeated tokens to avoid looping indefinitely. The archive reflects what the endpoint returns for your account.
+- Duplicate asset IDs are skipped within a listing; identical content under different IDs is not deduplicated. Entries without an asset ID, MIME type, creation time, or storage key are skipped with a warning.
+- Ctrl+C stops the run promptly: no new transfers or retries start, unfinished `.part` files are removed, metadata for complete files is written, and the exit status is 130. A forced process termination may prevent this cleanup.
+- Media download failures and an incomplete asset listing produce exit status 1. Prompt lookup failures can leave a successful media archive with incomplete generation metadata.
+- The tool follows pagination until no next-page token remains. Asset-list pages that fail with HTTP 429, 5xx, or a network error are retried with pauses growing from 5 to 120 seconds, and the remaining pages are paced once Grok rate-limits the listing. If the listing still ends early or a page token repeats, the assets already listed are downloaded and indexed before the run reports the incomplete listing; rerun later to complete the archive. The archive reflects what the endpoint returns for your account.
 
 ## Troubleshooting
 
 | Symptom | What to check |
 | --- | --- |
 | HTTP 401 / 403 | Re-export cookies and check `--ua`. If Chrome was recently updated, restart it before exporting. Access controls can also reject a request. |
-| HTTP 429 | Allow time before another run and reduce `--workers` if media requests are being limited. Prompt lookup concurrency is separately capped at three. |
+| HTTP 429 | Asset-list pages are retried automatically. If a run still reports an incomplete listing, allow time before rerunning; assets already listed are kept. Reduce `--workers` if media requests are being limited. Prompt lookup concurrency is separately capped at three. |
 | HTTP 000 or a curl error | Check connectivity, curl availability, and proxy settings. Set `HTTPS_PROXY` explicitly if your connection requires a proxy. |
-| Cannot read metadata.json | Restore or back up the existing file before rebuilding it. The script stops rather than overwriting an unreadable or invalid metadata file. |
+| Cannot read metadata.json | Restore or back up the existing file before rebuilding it. The script checks the file before contacting Grok and stops rather than overwriting an unreadable or invalid metadata file. |
+| Cookie path contains `=` | curl reads an argument containing `=` as cookie data rather than a file name. Move or rename the cookie file or its folder. |
 | Missing prompts | Use `--prompts`; the file must already be complete locally and its source conversation must be accessible. |
 | `?` characters in redirected Windows console output | Set `PYTHONUTF8=1` before running. Metadata is always written as UTF-8. |
 
